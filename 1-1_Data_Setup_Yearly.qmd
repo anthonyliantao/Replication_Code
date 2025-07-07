@@ -68,11 +68,11 @@ set.seed(2025)
 # 读取美国普查1990职业列表
 # https://usa.ipums.org/usa/volii/occ1990.shtml
 occ1990 <- read_csv(
-  here("helper", "occ1990.csv"),
+  here("helper", "occ_dictionary.csv"),
   show_col_types = FALSE,
   col_types = cols(.default = col_character())
 )
-occ_list <-  occ1990$occ1990_labels
+occ_list <-  occ1990$occ_label
 
 # 随机生成职业转移记录
 n <- 20000
@@ -257,12 +257,176 @@ fwrite(w_year_nonec, here("data", paste0("obs_weights_", s_spec, "_NoNEC.csv")))
 - **含 NEC 权重**：基于全部职业类别的样本；
 - **不含 NEC 权重**：剔除未具体分类职业后的样本。
 
-## 6. 总结
+## 6. 筛选出稳定职业
 
-本文件完成了原始职业转移数据的清理、标准化与结构化输出：
+自定义函数：`get_missing_pattern()`
+```{r}
+#| code-fold: true
+#| code-summary: "查看完整代码"
+#' 获取每个职业在不同时间窗口中的缺失模式
+#' 
+#' @param dat 一个 data.table 数据对象，必须包含列 occ1, occ2, int_year（职业转移数据）
+#' @param w_size 滑动窗口大小（可取 1, 3, 5）
+#' @param include_isolates 是否保留自环或孤立职业（默认 FALSE，即去除 occ1 == occ2 的转移）
+#' @return 返回一个 data.table，列出每个职业在每个年份的出现情况以及缺失模式
+get_missing_pattern = function(
+    dat, 
+    w_size = c(1, 3, 5),
+    include_isolates = FALSE) 
+{
+    # 检查输入数据是否包含必需的列
+    if (!all(c("occ1", "occ2", "int_year") %in% names(dat)))
+        stop("dat has to contain the columns occ1, occ2, and int_year")
+    
+    # 检查 w_size 是否有效
+    if (!all(w_size %in% c(1, 3, 5)))
+        stop("w_size has to be a subset of c(1, 3, 5)")
+    
+    # 如果不保留孤立职业（自环），则去除 occ1 == occ2 的记录
+    if (!include_isolates) 
+        dat = dat[occ1 != occ2]
+    
+    # 获取所有出现过的职业（无重复）
+    occs  = dat[, unique(c(occ1, occ2))]
 
-- 合并了教学相关职业分类；
-- 排除了不规则类别（NEC）；
-- 按样本类型（全体、男性、女性）分别处理；
-- 生成了标准化年份权重，供后续指数估计使用
+    # 获取所有年份并转为字符向量（便于作为列名）
+    y_char = paste0(dat[, sort(unique(int_year))])
+    
+    # 统计每个职业在哪些年份中出现过（按 int_year 分组后展开）
+    m_dat = dat[
+        , .(occ_label = unique(c(occ1, occ2))), by = int_year
+    ] %>%
+        dcast(occ_label ~ int_year, value.var = "int_year")
+    
+    # 将出现记录转为 1（出现）/0（缺失）
+    m_dat[
+        , 
+        (y_char) := lapply(.SD, function(w) as.numeric(!is.na(w))), 
+        .SDcols = y_char
+    ][
+        ,
+        # 计算每个职业缺失的年份数量
+        n_miss := length(y_char) - rowSums(.SD), 
+        .SDcols = y_char
+    ]
+    
+    # 将每个职业的年份出现情况合并为一个字符串（用于匹配缺失模式）
+    m_dat[
+        , m_pattern := apply(m_dat[, y_char, with = F],
+                             1L, 
+                             paste0, 
+                             collapse = "")
+    ]
+    
+    # 遍历每个窗口长度（w_size），统计在该窗口大小下缺失的连续“0”片段数
+    
+    for (w in w_size) {
+        
+        m_dat[, `:=`
+            (
+                paste0("m_count_win_", w),
+                stringr::str_count(
+                    m_pattern, 
+                    # 匹配连续 w 个 0 的字符串
+                    paste0(rep("0", w), collapse="")
+                )
+            )
+        ]
+        
+    }
+    
+    # 返回结果表格（每行一个职业，附带各窗口下的缺失统计
+    return(m_dat)
+    
+}
+```
 
+```{r}
+# 读取不含 NEC 的聚合转移数据
+nonec_dat = fread(here("data", "dat_FullSamp_agg_NoNEC.csv"))
+
+# 获取职业在各个 5 年滑动窗口中是否缺失的模式
+m_pat = get_missing_pattern(
+    dat = nonec_dat, 
+    w_size = 5,
+    include_isolates = FALSE)
+
+datatable(
+  head(m_pat),
+  options = list(dom = 't')
+)
+```
+
+---
+
+🔹 `m_pattern`：年份出现模式字符串
+
+- 某个职业在各年份中是否出现，1（出现）和 0（缺失）组成的二进制字符串；
+
+🔹 m_count_win_{w}：连续缺失窗口计数
+
+- 统计该职业在整个时间序列中，**出现了多少次“连续5年都未出现”**的情况；
+- 对于 `m_pattern` 10000011000001，值为2
+
+---
+
+```{r}
+# 选出在所有 5 年窗口中都未缺失的职业
+occ_5 = m_pat[m_count_win_5 == 0]$occ_label
+
+# 从原始数据中过滤只保留这些完整职业的转移数据
+nonec_dat_5 = nonec_dat[(occ1 %in% occ_5) & (occ2 %in% occ_5)]
+
+# 检查职业子集是否一致
+if (length(occ_5) != length(nonec_dat_5[, unique(c(occ1, occ2))]))
+    stop("dimension mismatch after subsetting")
+  
+# 保存数据
+fwrite(nonec_dat_5, here("data", "dat_FullSamp_agg_NoNEC_complete5.csv"))
+```
+
+## 7. 建立职业名称映射表
+
+```{r}
+dict = read_csv(here("helper", "occ_dictionary.csv")) %>%
+    data.table
+
+# 确保职业名称是字符型，避免后续合并出错
+dict = dict[, occ_label := as.character(occ_label)]
+
+# 从分析数据中提取实际出现的职业名称（occ1/occ2）
+# 赋予一个自增的职业 ID
+nonec_dat[
+    , .(occ_label = unique(c(occ1, occ2)))
+][
+    , occ_id := .I
+]
+
+# 将官方字典（含 OCC1990 编码）与实际出现职业名称合并
+dict = dict %>%
+    merge(
+        nonec_dat[
+            , .(occ_label = unique(c(occ1, occ2)))
+        ][
+            , occ_id := .I
+        ],
+        by = "occ_label",
+        all.y = TRUE
+    ) %>%
+    setnames("occ_numeric", "occ_1990")
+
+# 检查完整性
+# 是否有ID缺口
+if (max(dict$occ_id) != nrow(dict))
+    stop("some occ_ids are missing")
+# 是否所有出现的职业都能匹配到字典
+if (nrow(dict) != length(nonec_dat[, unique(c(occ1, occ2))]))
+    stop("some occupations in the dataset are not in the dictionary")
+
+# 保存字典
+fwrite(dict, here("data", "labmap_NoNEC.csv"))
+
+datatable(
+  dict
+)
+```
