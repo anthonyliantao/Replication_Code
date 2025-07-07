@@ -1,0 +1,268 @@
+---
+title: "处理年份数据"
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    toc-title: "目录"
+execute:
+  echo: true
+  warning: false
+  message: true
+---
+
+## 0. 简介
+
+本笔记基于 [`1-1_Data_Setup_Yearly.R`](1-1_Data_Setup_Yearly.R) 脚本，详解其数据处理逻辑: 
+
+原脚本的处理逻辑：
+
+- 读取原始 CPS-ASEC 职业流动数据；
+- 合并细分类职业标签（如教师与助教）；
+- 排除 NEC（未另分类）类别；
+- 生成按年分组的职业流动数据与权重。
+
+本笔记的修改：
+
+- 生成 fake data 以支持继续操作
+- 将部分重要操作的 data.frame 语法改为了熟悉的 tidyverse 语法
+- 增加了文字解释
+
+## 1. 环境设置
+
+```{r}
+library(here)
+library(dplyr)
+library(tidyverse)
+library(readr)
+library(data.table)
+library(DT)
+```
+
+## 2. 读取数据
+
+本脚本依赖根据完整的CPS-ASEC 职业流动数据，以及男女分样本。虽然原始数据暂时不可得，但根据 [README](README.md) 中的描述，我们可以推断出数据文件 `edges_67to15ASEC_dropimp_primeage.dta` 的结构。
+
+### 2.1. 数据简介
+
+- 数据来源：CPS-ASEC 1975–2014 样本
+- 样本范围：25–55 岁就业者
+- 过滤条件：排除了职业信息为“插补值”（imputed occupation）的个体
+- 单位：每条记录是一笔职业转移（从 occ1 → occ2）
+
+### 2.2. 字段结构
+
+| 变量名 | 类型 | 含义        |
+|-----|-----|---------------|
+| `occ1`        | character  | 转出职业（起点）职业名称|
+| `occ2`        | character  | 转入职业（终点）职业名称|
+| `year_begin`  | integer    | 转移的起始年份（通常是受访年份 - 1）|
+
+### 2.3. 生成假数据集
+
+```{r make_data}
+# 设置随机种子，保证可复现
+set.seed(2025)
+
+# 读取美国普查1990职业列表
+# https://usa.ipums.org/usa/volii/occ1990.shtml
+occ1990 <- read_csv(
+  here("helper", "occ1990.csv"),
+  show_col_types = FALSE,
+  col_types = cols(.default = col_character())
+)
+occ_list <-  occ1990$occ1990_labels
+
+# 随机生成职业转移记录
+n <- 20000
+fake_data <- tibble(
+  occ1 = sample(occ_list, n, replace = TRUE),
+  occ2 = sample(occ_list, n, replace = TRUE),
+  year_begin = sample(1975:2013, n, replace = TRUE)
+)
+
+# 分别采样男女子集
+fake_data_m <- fake_data %>% slice_sample(n = n / 2)
+fake_data_f <- fake_data %>% slice_sample(n = n / 2)
+
+# 保存到文件（覆盖写入）
+haven::write_dta(fake_data, here("rawdata", "edges_67to15ASEC_dropimp_primeage.dta"))
+haven::write_dta(fake_data_m, here("rawdata", "edges_67to15ASEC_dropimp_primeage_m.dta"))
+haven::write_dta(fake_data_f, here("rawdata", "edges_67to15ASEC_dropimp_primeage_f.dta"))
+```
+
+### 2.4. 读取数据集
+
+```{r load_data}
+# 分析起始年份
+start_year = 1989
+
+# 样本设置
+# 注意: “FullSamp”（总体样本）必须放在最后一项
+# 具体原因见 Gen_Period_Data.R 脚本中的说明
+samp_spec = c(
+  "Male",    # 男性样本
+  "Female",  # 女性样本
+  "FullSamp" # 总体样本
+)
+
+# 确保 FullSamp 在样本规格中的顺序最后
+if (samp_spec[length(samp_spec)] != "FullSamp") {
+  samp_spec <- c(setdiff(samp_spec, "FullSamp"), "FullSamp")
+}
+
+for (s_spec in samp_spec) {
+    
+    d_file <- switch(s_spec,
+        "FullSamp" = "edges_67to15ASEC_dropimp_primeage.dta",
+        "Male"     = "edges_67to15ASEC_dropimp_primeage_m.dta",
+        "Female"   = "edges_67to15ASEC_dropimp_primeage_f.dta",
+        stop("Unknwon sample specification!")
+    )
+
+    dat <- readstata13::read.dta13(here::here("rawdata", d_file)) %>%
+        data.table() %>%
+        mutate(int_year = year_begin + 1L) %>%
+        select(occ1, occ2, int_year) %>%
+        filter(int_year >= start_year)
+}
+
+datatable(
+  head(dat),
+  rownames = FALSE,
+  options = list(
+    dom = 't'
+  )
+)
+```
+
+
+## 3. 数据处理
+
+- 将类似 "Subject instructors" 合并为统一类别；
+- 将 "Teacher's aides" 合并到 "Teachers , n.e.c."；
+
+```{r}
+# 在起始与终点职业中查找包含 "instruct" 的职业名称
+ins_1 <- grep("instruct", unique(dat$occ1), value = TRUE, ignore.case = TRUE)
+ins_2 <- grep("instruct", unique(dat$occ2), value = TRUE, ignore.case = TRUE)
+# 合并起点和终点职业中所有含 instruct 的名称并去重
+instructors <- unique(c(ins_1, ins_2))
+# 移除不想合并的两个特定职业，保留其他“instructor”职业
+instructors <- setdiff(
+    instructors, 
+    c("Athletes, sports instructors, and officials", "Subject instructors (HS/college)")
+)
+# 将 属于 instructors 的职业统一替换为 "Subject instructors (HS/college)"
+dat[occ1 %in% instructors, occ1 := "Subject instructors (HS/college)"]
+dat[occ2 %in% instructors, occ2 := "Subject instructors (HS/college)"]
+
+# 将名为"Teacher's aides" 的职业合并到 "Teachers , n.e.c."
+dat[occ1 == "Teacher's aides", occ1 := "Teachers , n.e.c."]
+dat[occ2 == "Teacher's aides", occ2 := "Teachers , n.e.c."]
+```
+
+## 4. 保存清洗数据
+
+```{r}
+# 保存完整版本
+if (s_spec == "FullSamp") {
+    fwrite(dat[, .(occ1, occ2, int_year)],
+    here("data", paste0("dat_", s_spec, "_FullOccs.csv")))
+}
+
+fwrite(
+    # dat[, .N, by = .(occ1, occ2, int_year)],
+    dat %>%
+        group_by(occ1, occ2, int_year) %>%
+        summarise(N = n(), .groups = "drop"),
+    here("data", paste0("dat_", s_spec, "_agg_FullOccs.csv"))
+    )
+
+# NEC 类别的正则表达式，用于识别未具体分类职业
+nec_regex = c(
+  "n\\.e\\.c", 
+  "n\\. e\\. c\\.",
+  "nec", 
+  "elsewhere"
+) 
+
+# 排除 NEC 类别
+nec_pattern <- paste0(nec_regex, collapse = "|")
+nonec_dat <- dat[!grepl(nec_pattern, occ1, ignore.case = TRUE) & !grepl(nec_pattern, occ2, ignore.case = TRUE)]
+
+if (s_spec == "FullSamp") {
+    fwrite(nonec_dat[, .(occ1, occ2, int_year)], 
+    here::here("data", paste0("dat_", s_spec, "_NoNEC.csv")))
+}
+
+fwrite(
+    #nonec_dat[, .N, by = .(occ1, occ2, int_year)], 
+    nonec_dat %>%
+        group_by(occ1, occ2, int_year) %>%
+        summarise(N = n(), .groups = "drop"),
+    here::here("data", paste0("dat_", s_spec, "_agg_NoNEC.csv"))
+)
+```
+
+将清洗后的数据保存为四个主要文件：
+
+1. **`dat_FullSamp_FullOccs.csv`**  
+   - 包含全样本（FullSamp）中所有职业类别的原始转移数据（未聚合）。  
+   - 每一行为一条职业转移记录，包含起始职业（`occ1`）、目标职业（`occ2`）和对应年份（`int_year`）。  
+
+2. **`dat_FullSamp_agg_FullOccs.csv`**  
+   - 对全样本职业转移数据按职业对和年份聚合后的数据。  
+   - 每条记录为某起始职业转移到某目标职业在某年份发生的次数（用 `.N` 计数）。  
+
+3. **`dat_FullSamp_NoNEC.csv`**  
+   - 从全样本中排除了 NEC（未具体分类职业）类别后，保留的原始转移数据（未聚合）。  
+   - 便于排除不明确职业对后，进行更精确的职业流动分析。  
+
+4. **`dat_FullSamp_agg_NoNEC.csv`**  
+   - 排除 NEC 后的职业转移数据聚合版本，统计每对职业在各年份的转移次数。  
+
+## 5. 生成标准化年份权重
+
+```{r}
+# 权重标准化的基准年份
+w_stand_year = 1989
+
+# 含 NEC 的权重
+w_year <- dat %>%
+  count(int_year) %>%
+  mutate(
+    n_stand = n[int_year == w_stand_year],
+    obs_weights = n_stand / n
+  ) %>%
+  select(-n)  # 去掉样本计数列
+
+fwrite(w_year, here("data", paste0("obs_weights_", s_spec, "_FullOccs.csv")))
+
+# 不含 NEC 的权重
+w_year_nonec <- nonec_dat %>%
+  count(int_year) %>%
+  mutate(
+    n_stand = n[int_year == w_stand_year],
+    obs_weights = n_stand / n
+  ) %>%
+  select(-n)
+
+fwrite(w_year_nonec, here("data", paste0("obs_weights_", s_spec, "_NoNEC.csv")))
+```
+
+生成权重，对不同年份的样本规模进行标准化，确保基准年份（1989）的观察值数为参考值，其他年份根据样本大小进行调整。
+
+- **含 NEC 权重**：基于全部职业类别的样本；
+- **不含 NEC 权重**：剔除未具体分类职业后的样本。
+
+## 6. 总结
+
+本文件完成了原始职业转移数据的清理、标准化与结构化输出：
+
+- 合并了教学相关职业分类；
+- 排除了不规则类别（NEC）；
+- 按样本类型（全体、男性、女性）分别处理；
+- 生成了标准化年份权重，供后续指数估计使用
+
