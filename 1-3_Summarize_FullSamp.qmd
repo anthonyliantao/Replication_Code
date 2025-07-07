@@ -1,0 +1,354 @@
+---
+title: "1-3 汇总 FullSamp 数据"
+format: 
+  html: 
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    toc-title: "目录"
+execute:
+  echo: true
+  warning: false
+  message: true
+---
+
+## 💡 说明
+
+本脚本用于汇总 `FullSamp` 数据在各年份下的转移结构统计，并绘制 `Figure_E1.pdf`。包含两个子样本：
+
+- `FullOccs`：包含所有职业
+- `NoNEC`：排除了 `n.e.c.`（未另分类）职业
+
+输出包括图像文件和 `.rds` 数据，用于进一步复现图表或论文绘图。
+
+---
+
+## ⚙️ 环境设置
+
+```{r env_setup}
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(here)
+library(DT)
+
+# 正则, 辅助识别 NEC 职业
+nec_regex = c("n\\.e\\.c", 
+              "n\\. e\\. c\\.",
+              "nec", 
+              "elsewhere")
+
+# ggplot 主题
+fnb_theme = theme_bw() +
+    theme(
+        panel.grid        = element_blank(),
+        strip.background  = element_blank(),
+        panel.border      = element_rect(colour = "black"),
+        strip.text        = element_text(size = 16,
+                                         hjust = .05,
+                                         face = "bold"),
+        axis.title        = element_text(size = 14),
+        legend.background = element_rect(fill = "white",
+                                         colour = "black",
+                                         size = .1),
+        legend.key.size   = unit(2, "line"),
+        legend.key.height = unit(1, "line"),
+        legend.position = c(.99,.025),
+        legend.justification = c(1, 0),
+        legend.direction = "horizontal"
+    )
+
+```
+
+## 1. 加载数据和权重
+
+```{r load_data}
+
+# 加载职业流动数据
+dat_full  <- fread(here("data", "dat_FullSamp_agg_FullOccs.csv"))
+dat_nonec <- fread(here("data", "dat_FullSamp_agg_NoNEC.csv"))
+
+# 加载权重
+w_nonec <- fread(here("data", "obs_weights_FullSamp_NoNEC.csv"))
+```
+
+## 2. 构建年度指标汇总表
+
+### 2.1. `tie_summary()` 
+
+用于生成职业转移网络中各年份的汇总指标的函数。持滑动窗口、NEC 职业筛除、加权样本调整等选项。主要输出包括：
+
+- 各年份总转移次数（`No. Observations`）；
+- 各年份跨职业转移次数（`No. Between-Occupation Transitions`）；
+- 跨职业转移占比（`% Between-Occupation Transitions`）；
+- 各年份参与跨职业转移的唯一职业数量。
+
+```{r def_tie_summary}
+#| code-fold: true
+#| code-summary: "查看源码"
+#' Generating Tie Summaries
+#' 
+#' @param x \code{data.table} object
+#' @param w_dat \code{data.table} object that contains weights to apply to different years
+#' @param nonec boolean; if TRUE, not-elsewhere-classified occupations are dropped before summarizing results
+#' @param win numeric; size of moving window for which summaries are generated. Must be an odd integer
+#' @param trim boolean; if TRUE, end-years are trimmed before summarizing results. Otherwise, end-years are included even if window size is smaller than that specified
+#' @details The \code{data.table} object \code{x} must contain the columns \code{occ1, occ2, int_year, N}, which represent, respectively, the sender occupation, receiver occupation, the interview year (so that \code{occ2} is the occupation the respondent currently occupies), and the number of respondents who followed this transition pattern. The `w_dat` object, on the other hand, should contain the columns \code{int_year} and \code{obs_weights} that contain information about the interview year and the weights to be applied for that year.
+#' @return returns summaries of ties
+
+tie_summary = function(
+    x, 
+    w_dat = NULL, 
+    nonec  = FALSE,
+    nec_regex = NULL,
+    win    = 1L,
+    trim   = TRUE,
+    verbose = TRUE) 
+{
+   
+    # check data format
+    if (!is.data.table(x)) 
+        stop("Input has to be data.table")
+    
+    if (!all(names(x) %in% c("occ1", "occ2", "int_year", "N"))) 
+        stop("Input data has to contain columns occ1, occ2, int_year, N")
+        
+    # apply weights if specified
+    if (!is.null(w_dat)) {
+        
+        if (verbose)
+            message("Applying normalizing weights ...")
+        
+        if (!all(c("int_year", "obs_weights") %in% names(w_dat)))
+            stop("w_dat does not contain columns int_year and obs_weights")
+        
+        dat = merge(
+                x, 
+                w_dat[, list(int_year, obs_weights)],
+                by = "int_year"
+        )
+
+        dat[
+            , N := N * obs_weights
+        ][
+            , obs_weights := NULL
+        ]
+        
+    } else {
+        
+        if (verbose)
+            message("Not using normalizing weights ...")
+        
+        dat = x
+        
+    }
+
+    # drop nec occupations if specifeid
+    if (nonec) {
+        
+        if (is.null(nec_regex))
+            stop("need nec_regex when nonec is specified")
+        
+        if (verbose) 
+            message("Dropping NEC occpuations ...")
+        
+        reg_vec = paste0(nec_regex, collapse="|")
+        
+        dat = dat[!grepl(reg_vec, occ1) & !grepl(reg_vec, occ2)]
+        
+    }
+
+    # generate moving windows
+    years = unique(dat[, int_year]) %>% 
+        sort
+    
+    periods = sapply(years, function(w) {
+        
+        start = max(w - (win - 1)/2, min(years))
+        end = min(w + (win - 1)/2, max(years))
+        mid = w
+        
+        return(c(start, mid, end))
+        
+    }) %>% t
+
+    # trim end-points?
+    if (trim) {
+        
+        periods = periods[
+            !duplicated(periods[,1], fromLast=T) & 
+                !duplicated(periods[,3], fromLast=F),
+            ]
+        
+    }
+
+    # generate total obs. and between-occ obs within windows
+    x_win = lapply(1:nrow(periods), function(y) {
+        
+            res = dat[
+                int_year >= periods[y, 1] & int_year <= periods[y, 3],
+                sum(N),
+                by = list(occ1, occ2)
+            ] %>%
+            setnames("V1","N")
+            
+            res[, mid_year := periods[y, 2]]
+            return(res)
+        
+        }) %>%
+    rbindlist %>%
+    setcolorder(c("occ1", "occ2", "mid_year", "N"))
+
+    # generate total obs. and between occ obs
+    y = merge(
+        x_win[, sum(N), by = mid_year],
+        x_win[occ1 != occ2, sum(N), mid_year],
+        by = "mid_year",
+        all = TRUE
+    ) %>%
+        setnames(c("mid_year", "ws", "nos"))
+    
+    # generate % between
+    y[, rr := nos/ws] 
+    
+    # add number of non-isolated unique occs
+    y = merge(y, 
+        x_win[occ1 != occ2, length(unique(c(occ1, occ2))), by = mid_year],
+        by="mid_year"
+    ) %>%
+        setnames(c("year",
+                   "No. Observations",
+                   "No. Between-Occupation Transitions",
+                   "% Between-Occupation Transitions",
+                   "No. Unique Non-isolated Occupations")
+        )
+    
+    # change all columns to "double" format (for melting)
+    y = y[, lapply(.SD, as.numeric)]
+    
+    # melt and add type-variable
+    z = melt(y, id.vars = "year")
+    z[
+        , `:=`(
+            weighted = ifelse(is.null(w_dat), F, T),
+            nec = ifelse(nonec, 
+                        "NEC Occupations Excluded", 
+                        "All Occupations")
+        )
+    ]
+    
+    return(z)
+}
+```
+
+### 2.2. 汇总 ties
+
+```{r sum_ties}
+sum_dat <- rbind(
+  tie_summary(dat_full,  w_nonec, verbose = FALSE),
+  tie_summary(dat_nonec, w_nonec, nonec = TRUE, nec_regex = nec_regex, verbose = FALSE)
+)
+
+# 标记是否为 NoNEC 数据，并设定因子顺序
+sum_dat[, nec := factor(nec, levels = rev(unique(sum_dat$nec)))]
+
+datatable(
+    sum_dat |>
+    group_by(variable) |>
+    slice_head(n = 1) |>
+    ungroup()
+)
+```
+
+上表展示了基于职业转移数据生成的年度汇总指标，每一行代表某一年份下的某一项指标值。主要字段解释如下：
+
+| 变量名       | 含义                                                             |
+|--------------|---------------------------------------------------------|
+| `year`       | 中心年份（滑动窗口的中点年份）|
+| `variable`   | 指标名称，具体包括：  
+|              | &nbsp;&nbsp;• `No. Observations`：该年度窗口中总转移记录数         |
+|              | &nbsp;&nbsp;• `No. Between-Occupation Transitions`：跨职业转移记录数 |
+|              | &nbsp;&nbsp;• `% Between-Occupation Transitions`：跨职业转移比例     |
+|              | &nbsp;&nbsp;• `No. Unique Non-isolated Occupations`：参与转移的独立职业数 |
+| `value`      | 对应指标的数值（可为整数或比例）                                  |
+| `weighted`   | 是否对转移数据应用了样本权重（TRUE 表示加权）                      |
+| `nec`        | 是否剔除了 `n.e.c.` 职业类别（如为 `"NEC Occupations Excluded"`）则代表已排除该类模糊职业 |
+
+## 3. 绘图
+
+```{r plot_fig_e1}
+#| label: plot_fig_e1
+#| fig-cap: "Figure E1：年度职业转移结构指标"
+#| fig-width: 10
+#| fig-height: 7
+
+library(ggplot2)
+
+p <- ggplot(sum_dat, aes(x = year, y = value, col = nec, linetype = nec)) + 
+  geom_line(size = 0.6) +
+  scale_x_continuous(breaks = 1989:2015) +
+  scale_color_manual("", values = c("black", "grey50")) +
+  scale_linetype_manual("", values = 1:2) +
+  labs(x = "Year", y = NULL) +
+  facet_wrap(~ variable, scales = "free_y") +
+  fnb_theme +
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 0.5),
+    legend.position = c(0.755, 0.01),
+    legend.background = element_rect(fill = "white", colour = "black", size = 0.1),
+    legend.key.size = unit(2, "line"),
+    legend.key.height = unit(1, "line"),
+    legend.direction = "vertical",
+    legend.title = element_blank()
+  )
+
+# 导出为 PDF
+ggsave(
+  filename = here::here("output", "figures", "Figure_E1.pdf"),
+  plot = p,
+  width = 10, height = 7
+)
+
+# 在 HTML 中显示
+p
+```
+
+该图展示了职业流动网络在 1989–2015 年间的结构性指标趋势。图中每个子图对应一个指标，横轴为年份，纵轴为指标数值。
+
+> ⚠️ 注意：该图由随机生成的假数据绘制。不代表真实情况。
+
+### 图例
+
+- **黑色实线**：包含所有职业（包括 `n.e.c.` 类别）计算所得；
+- **灰色虚线**：剔除 `n.e.c.` 职业后重新计算所得；
+- 每个子图表示一个不同的指标维度。
+
+### 指标
+
+#### (a) No. Observations
+
+每年观测到的总转移次数。该指标反映了样本中所有职业流动（无论是否跨职业）的总体活跃程度。
+
+- **高点**：说明该年份记录了更多的职业变动，可能与样本量扩大、调查设计变化、或劳动力市场波动（如经济危机、产业重组）有关；
+- **低点**：说明该年份的职业变动事件较少，可能是劳动者流动性下降，或调查年份的样本较小。
+
+#### (b) No. Between-Occupation Transitions
+
+不同职业之间的转移次数。该指标聚焦于真正的职业流动，即从一种职业类别转移到另一种。
+
+- **高点**：表明更多人跨职业转移，可能意味着职业边界模糊、技能可迁移性增强，或转行门槛降低；
+- **低点**：说明大多数流动局限于职业内部，如岗位轮换、晋升等，职业结构相对稳定或封闭。
+
+#### (c) % Between-Occupation Transitions
+
+：跨职业转移占比。衡量职业结构的开放性与职业边界的渗透程度。
+
+- **高点**：职业间转换更频繁，职业结构更开放，流动路径多元，反映“去职业化”或技能可迁移性提高的趋势；
+- **低点**：流动更集中于职业内部，说明职业之间边界更清晰，或存在更高的准入门槛。
+
+#### (d) No. Unique Non-isolated Occupations
+
+参与跨职业转移的不同职业数量（排除孤立职业）。该指标衡量职业流动网络的连通性和参与度，排除了仅自循环的“孤立职业”。
+
+- **高点**：更多职业参与到职业流动中，结构更多元、更互联；
+- **低点**：流动集中在少数职业之间，职业结构呈现边缘化或分割特征。
