@@ -1,0 +1,144 @@
+---
+title: "1-2 构建分周期 NoNEC 样本数据"
+format: 
+    html: 
+        toc: true
+        toc-depth: 3
+        toc-location: left
+        toc-title: "目录"
+execute:
+  echo: true
+  warning: false
+  message: true
+---
+
+## 💡 说明
+
+本文件用于根据变量 `p_vec` 定义的时间段，构造分周期职业转移数据：
+
+- **样本规格**：FullSamp（全样本）  
+- **职业过滤**：排除 NEC 职业  
+- **权重处理**：使用标准化权重进行样本调整  
+- **输出数据**：以三周期结构按年或窗口写入 `data/` 目录
+
+## ⚙️ 环境设置
+
+```{r env-obj}
+library(here)
+library(data.table)
+library(DT)
+library(tidyverse)
+```
+
+## 1. 加载数据
+
+```{r load_data}
+dat = fread(here("data", "dat_FullSamp_agg_NoNEC_complete5.csv"))
+weights = fread(here("data", "obs_weights_FullSamp_NoNEC.csv"))
+```
+
+## 2. 样本加权
+
+```{r apply_weights}
+dat <- dat %>%
+  left_join(weights, by = "int_year") %>% 
+  mutate(N = N * obs_weights) %>% 
+  select(-obs_weights)
+```
+
+## 3. 生成分周期数据集
+
+```{r gen_prd_dt}
+
+# 分析的时间区间
+# 1）若分析周期跨越多个年份，用字符串表示连续区间
+#    如 "9296" 表示 1992 年到 1996 年
+# 2）若分析单独年份，使用数值型向量
+#    如 c(1992, 1993, 1994) 分别代表三个单年
+p_vec = c("9296", "0307", "1115")
+
+for (pp in p_vec) {
+
+    if (is.character(pp)) {
+
+        if (as.numeric(pp) %in% 1989:2015) {
+
+            # 若为单一特定年份（如 "2005"）
+            fwrite(
+                dat[int_year == as.numeric(pp)],
+                here("data", paste0("dat_", pp, "_NoNEC_weighted_complete5.csv"))
+            )
+
+        } else {
+
+            # 若为跨年区间（如 "0307"）
+            start_y = substr(pp, 1, 2) %>%
+                (\(s) ifelse(substr(s, 1, 1) %in% c("0", "1"), paste0("20", s), paste0("19", s)))() %>%
+                as.numeric
+
+            end_y = substr(pp, 3, 4) %>%
+                (\(e) ifelse(substr(e, 1, 1) %in% c("0", "1"), paste0("20", e), paste0("19", e)))() %>%
+                as.numeric
+
+            fwrite(
+                dat[int_year %in% start_y:end_y, .(N = sum(N)), by = list(occ1, occ2)],
+                here("data", paste0("dat_", pp, "_NoNEC_weighted_complete5.csv"))
+            )
+        }
+
+    } else if (is.numeric(pp)) {
+
+        # 若为数值向量（如 2007）
+        fwrite(
+            dat[int_year == pp],
+            here("data", paste0("dat_", pp, "_NoNEC_weighted_complete5.csv"))
+        )
+
+    } else {
+        stop("p_vec is neither a character nor a numeric vector")
+    }
+}
+```
+
+### 说明
+
+- 输出文件命名规则为 `dat_周期_NoNEC_weighted_complete5.csv`
+- 权重为标准化后的年度权重（相对基准年调整）；
+- 完整职业对转移频数数据存于 data/ 目录；
+
+## 4. （可选）保存标签
+
+`map_labels()`: 
+
+```{r def_map_lbl}
+#| code-fold: true
+#| code-summary: "查看完整代码"
+
+#' Create a mapping between factor/character vector and corresponding numeric values
+#' 
+#' @param x a \code{factor} or \code{character} vector
+#' @return returns a two dimensional \code{data.table}, where the first column is the numeric value and the second column the corresponding label
+map_labels = function(x) {
+    
+    if (!requireNamespace("gdata", quietly = TRUE))
+        stop("requires gdata package to be installed")
+    
+    lmap = gdata::mapLevels(x)
+    
+    lab_mapping = data.table(
+        id   = as.integer(lmap), 
+        label = names(lmap)
+    )
+    
+    return(lab_mapping)
+    
+}
+```
+
+```{r save_lbl}
+fwrite(
+    map_labels(dat[, unique(occ1, occ2)]),
+    here("data", "labmap_3p_NoNEC_complete5.csv")
+)
+```
+
