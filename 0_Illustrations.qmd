@@ -1,0 +1,373 @@
+---
+title: "0. 网络流动与社群结构图示"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    toc-title: "目录"
+execute:
+  echo: true
+  warning: false
+  message: true
+---
+
+本 Quarto 文件用于图形化展示职业网络中的流动模式，复现了原文 Figure 1 中四幅图的生成过程，涵盖了：
+
+- (A) 网络图：展示节点之间的连接结构以及社群划分；
+- (B) 邻接矩阵：从矩阵角度反映节点之间的可达关系；
+- (C) 访问概率：从起点 G 出发，随机游走至目标节点 B、J、E、I 的概率随步数的变化
+- (D) 累计访问次数：起点 G 到这些目标节点在多步游走中的累计访问期望。
+
+所有边权被设为相等，以简化概率的计算。访问概率定义为“在给定步数内，从点 i 到终点 j 的概率”；累计访问次数则是这一概率在多个时点上的累加。
+
+## 0. 初始设置
+
+```{r setup}
+# 初始化：加载所需 R 包
+library(here)
+library(igraph)
+library(ggplot2)
+library(ggraph)
+library(data.table)
+library(gridExtra)
+library(cowplot)
+library(reshape2)
+
+library(showtext)  # 图片中文显示
+showtext.auto()
+library(tibble)  # 更好的数据展示效果
+library(DT)      # 更好的数据展示效果
+
+
+# 自定义图形主题（定义在_RUN_REPLICATION.R中）
+fnb_theme = theme_bw() +
+    theme(
+        panel.grid        = element_blank(),
+        strip.background  = element_blank(),
+        panel.border      = element_rect(colour = "black"),
+        strip.text        = element_text(size = 16,
+                                         hjust = .05,
+                                         face = "bold"),
+        axis.title        = element_text(size = 14),
+        legend.background = element_rect(fill = "white",
+                                         colour = "black",
+                                         size = .1),
+        legend.key.size   = unit(2, "line"),
+        legend.key.height = unit(1, "line"),
+        legend.position = c(.99,.025),
+        legend.justification = c(1, 0),
+        legend.direction = "horizontal"
+    )
+```
+
+## 1. 基础网络图
+
+这个图是一个**示意的有向图（directed graph）**，目的是为了说明**个体在网络中的移动（例如职业流动、迁移路径或信息传播）**。为后续分析如访问概率、社群结构提供可视化基础。
+
+### 1.1. 网络结构数据
+
+`igraph` 包描述网络结构的基础语法：
+
+-   A -+ B 表示 A → B（有向边，从 A 指向 B）。
+-   A +-+ B 表示 A ↔ B（双向边，即 A → B 且 B → A）。
+
+```{r basic-graph}
+g <- graph_from_literal(A +-+ B,
+                        B -+ C,
+                        C -+ D,
+                        D -+ E,
+                        E +-+ A,
+                        F +- G,
+                        G +- H,
+                        H +- I,
+                        I +- J,
+                        J +- F,
+                        A -+ F,
+                        J +-+ H,
+                        G -+ A)
+
+# 检查是否强连通
+stopifnot(is.connected(g, mode = "strong"))
+
+# 基础示意图
+plot(g, edge.arrow.size = 0.5, main = "网络结构示意图（基本）")
+```
+
+从图中可以看出，作者设计了一个很巧妙的结构帮助读者理解流动结构：它既有明确的子群体（两个环），也有跨群体联系（A），为社群检测、流动概率分析提供了很好的示范。
+
+## 2. 分组网络图
+
+```{r clustering}
+# 获取邻接矩阵并添加对角线（自环）
+A <- get.adjacency(g, sparse = FALSE)
+diag(A) <- 1
+
+# 构建包含自环的图
+g_w <- graph_from_adjacency_matrix(A)
+
+# 使用 Infomap 算法划分社群
+clust <- cluster_infomap(g_w)
+vertex_attr(g, "clust") <- membership(clust)
+
+# 可视化网络图（着色代表社群）
+ggraph(g, layout = "kk") +
+    geom_edge_link(
+      arrow = arrow(
+          length = unit(2, "mm"), 
+          type = "closed"),
+      edge_colour = "grey50") +
+    geom_node_point(aes(color = factor(clust)), size = 5) +
+    geom_node_text(aes(label = name), size = 5, nudge_y = 0.3) +
+    scale_color_manual(values = c("tomato", "steelblue")) +
+    ggtitle("网络结构（识别社群）") +
+    fnb_theme +
+    theme(legend.position = "none")
+```
+
+### 2.1. 概览
+
+这是一个更加“美化”和“结构化”的网络图，目的有两个：
+
+1.  更清晰地展示节点之间的连边结构（有向）
+2.  利用 Infomap 算法识别“社群”（cluster）并用颜色表示出来
+
+
+### 2.2. 对角线与自环
+
+邻接矩阵的对角线元素（即 $A_{ii}）$ 表示一个节点是否连接自己，也就是自环（self-loop）。
+
+```{r}
+diag(A) <- 1
+```
+
+表示给每个节点加上一条从自己指向自己的边。
+
+🧠 为什么要添加自环？
+
+-   反映了社会中个体流动的“惰性”，即相比转移到其他节点，个体更倾向于保持原来的位置不动；
+-   在马尔可夫链模拟中，自环可避免某些节点“强迫转移”；
+-   在社群识别中，自环可以提高算法的稳定性。
+
+### 2.3. 社群
+
+在网络分析中，**社群划分（clustering）** 是指将图中的节点划分为若干组，使得：
+
+-   同一组内的节点之间连接更紧密；
+-   不同组之间的连接相对稀疏。
+
+这种结构可以揭示网络中的“功能分区”或“子系统”，例如：
+
+-   社交网络中的朋友圈；
+-   职业流动中的职业群体；
+-   城市迁移中的区域集群。
+
+### 2.4. Infomap
+
+Infomap 是一种非常直观又强大的社群识别算法，由 Rosvall & Bergstrom (2008) 提出。
+
+其核心思想是：把网络中“信息流动”的路径进行压缩编码，以最短的信息量（bit）描述整个图的运动路径。
+
+它把节点之间的连接当作“路径”，让一个“随机游走者”在图中移动。如果某些节点内部的来回访问次数很多，那它们可以被编码为一个“局部地图（module）”。
+
+```{r}
+clust <- cluster_infomap(g)
+clust_tbl <- tibble(
+  node = names(membership(clust)),
+  cluster = membership(clust)
+)
+
+datatable(clust_tbl, caption = "节点与对应社群")
+
+```
+
+## 3. 可视化邻接矩阵
+
+```{r adjacency-matrix}
+A_df <- melt(A)
+colnames(A_df) <- c("Row", "Col", "Value")
+A_df$Row <- factor(A_df$Row, levels = rev(LETTERS[1:vcount(g)]))
+
+ggplot(A_df, aes(x = Col, y = Row)) +
+  geom_tile(aes(fill = factor(Value)), color = "white", size = 2) +
+  scale_fill_manual(values = c("lightgray", "black")) +
+  coord_fixed() +
+  ggtitle("Mobility Table 邻接矩阵") +
+  fnb_theme +
+  theme(axis.title = element_blank(), legend.position = "none")
+```
+
+### 3.1. 概览
+
+在这一步，我们将网络结构（graph）转换成一个二维矩阵的形式（邻接矩阵），并将其可视化为黑白方格图（tile plot），以此呈现出图中“从某个节点能否到达另一个节点”的信息。
+
+这个图可以类比为一个可能性地图或流动表：
+
+- 横轴代表 目的地节点（Destination）；
+- 纵轴代表 出发节点（Origin）；
+- 每个小方格代表从行节点能否直接到达列节点。
+
+图中的黑色格子表示存在一条边（即可直接到达），灰色表示没有连边。
+
+### 3.2. 邻接矩阵
+
+在图论中，**邻接矩阵（adjacency matrix)** 是用来描述图中各个节点之间是否存在边的一个数学工具。
+
+假设我们有一个图 $G$ ，包含 $n$ 个节点，那么它的邻接矩阵 $A$ 是一个 $n \times n$ 的矩阵，其中第 $i$ 行 第 $j$ 列的元素 $A_{ij}$ 表示从节点 $i$ 到节点 $j$ 是否存在一条边。
+
+```{r}
+# 获取邻接矩阵
+A <- get.adjacency(g, sparse = FALSE)
+
+A_df <- as.data.frame(A)
+A_df <- cbind(Node = rownames(A_df), A_df)
+
+datatable(
+  A_df,
+  rownames = FALSE,
+  caption = "邻接矩阵 A（1 表示存在有向边，0 表示无边）",
+  options = list(
+    pageLength = 10,
+    scrollX = TRUE,
+    dom = 'tip'
+  )
+)
+```
+
+其中：
+
+-   A\[1, 2\] = 1 表示 A → B 存在边连接
+-   0 表示没有边。
+
+## 4. 访问概率
+
+```{r visiting-probs}
+# 定义起点和终点
+org <- "G"
+dest <- c("B", "J", "E", "I")
+n_steps <- 10
+
+# 构建转移矩阵（行标准化）
+r_sums <- rowSums(A)
+P <- diag(1 / r_sums) %*% A
+rownames(P) <- colnames(P) <- rownames(A)
+
+# 初始化向量和结果矩阵
+org_id <- match(org, rownames(P))
+dest_id <- match(dest, rownames(P))
+res_mat <- matrix(NA, nrow = n_steps, ncol = length(dest))
+x <- rep(0, nrow(P)); x[org_id] <- 1
+p <- P
+
+for (z in 1:n_steps) {
+  y <- x %*% p
+  res_mat[z, ] <- y[dest_id]
+  p <- p %*% p
+}
+
+# 整理为长表
+p_df <- data.table(res_mat)
+colnames(p_df) <- dest
+p_df$Steps <- 1:n_steps
+p_df <- melt(p_df, id.vars = "Steps", variable.name = "Destination", value.name = "Probability")
+
+# 作图
+ggplot(p_df, aes(x = Steps, y = Probability, shape = Destination, linetype = Destination)) +
+  geom_point(size = 2) +
+  geom_line() +
+  ggtitle(paste0("（3）从节点 ", org, " 出发的访问概率")) +
+  fnb_theme
+```
+
+### 4.1. 概览
+
+在这一步中，我们想回答这样一个问题：
+
+> 如果从节点 G 出发，一个人在网络中随机行走，那么在不同“步数”之后，他出现在 B、J、E、I 这些目标节点上的概率分别是多少？
+
+我们通过构建 **马尔可夫转移矩阵**，并模拟“从起点出发”多步随机游走的过程，计算并可视化每一步到达每个目的地的**概率变化轨迹**。
+
+### 4.2. 转移矩阵
+
+```{r markovt-ts}
+P <- diag(1 / rowSums(A)) %*% A
+```
+
+这一步是核心：
+
+- A 是上一步构建的邻接矩阵（1 表示存在边）；
+- 每一行代表“出发节点”，每一列是“目的地”；
+- 行标准化后就得到转移概率矩阵 P，即：
+
+$$
+P_{ij} =
+\begin{cases}
+\displaystyle \frac{A_{ij}}{\sum\limits_{k=1}^n A_{ik}}, & \text{若 } \sum\limits_{k} A_{ik} > 0 \\
+0, & \text{若 } \sum\limits_{k} A_{ik} = 0
+\end{cases}
+$$
+
+其中
+
+- $P_{ij}$：表示从节点 i 一步跳转到节点 j 的概率；
+- $A_{ij}$：是邻接矩阵的元素，若从 i 到 j 有边，则为 1，否则为 0；
+- $\sum_k A_{ik}$：是节点 i 的出度，即它一共可以通向多少个节点；
+
+```{r markov-ts-dt}
+# 查看转移概率矩阵数据结构
+
+P_df <- round(as.data.frame(P), 2)
+P_df <- cbind(Origin = rownames(P_df), P_df)
+
+DT::datatable(
+  P_df,
+  rownames = FALSE,
+  caption = "Markov 转移概率矩阵 P（每行之和为 1）",
+  options = list(
+    scrollX = TRUE,
+    pageLength = 10,
+    dom = 'tip'
+  )
+)
+```
+
+### 4.3. 随机游走
+
+在这一部分，我们设定一个起点节点，从该点出发进行多步随机游走，模拟信息、人员或流动在网络中的传播过程。通过不断地与转移矩阵 $P$ 相乘，我们计算出在第 $z$ 步时，出现在各目标节点上的概率分布。
+
+```{r rd-walk}
+x <- rep(0, nrow(P)); x[org_id] <- 1
+
+for (z in 1:n_steps) {
+  y <- x %*% p
+  res_mat[z, ] <- y[dest_id]
+  p <- p %*% p
+}
+```
+
+- x 是一个状态向量，表示初始时刻我们100%在 G。
+- 每次迭代：
+  1. 用当前的转移矩阵 p 与状态向量 x 相乘，得到“走了 z 步后”的状态概率分布
+  2. 把目标节点（如 B、J、E、I）的概率提取出来放入结果矩阵；
+  3. 将 p 替换为 $P^z$，即累计 z 步的转移矩阵。
+
+## 5. 累积访问
+
+```{r expected-visits}
+e_df <- data.table(apply(res_mat, 2, cumsum))
+colnames(e_df) <- dest
+e_df$Steps <- 1:n_steps
+e_df <- melt(e_df, id.vars = "Steps", variable.name = "Destination", value.name = "Visits")
+
+ggplot(e_df, aes(x = Steps, y = Visits, shape = Destination, linetype = Destination)) +
+  geom_point(size = 2) +
+  geom_line() +
+  ggtitle(paste0("（4）从节点 ", org, " 出发的累计访问次数")) +
+  fnb_theme
+```
+
+这一部分展示的是：
+
+> 从起点 G 出发，随着步数增加，每个目标节点被“访问”的累计次数期望值是如何增长的？
+
+也就是说，不再只看第几步能否到达某个节点，而是把前 z 步所有“访问概率”加总起来，得到“总共访问过几次”的期望。
